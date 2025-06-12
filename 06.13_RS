@@ -1,0 +1,178 @@
+import streamlit as st
+import pandas as pd
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.metrics.pairwise import cosine_similarity
+import streamlit.components.v1 as components
+
+# ----------------------------------------------------
+# 1. 데이터 로드 함수
+# ----------------------------------------------------
+@st.cache_data
+def load_traveler_profiles(
+    path: str = "C:/Users/Hoon/Downloads/V3_동반자여행객 (1).csv"
+) -> pd.DataFrame:
+    df = pd.read_csv(path, dtype=str)
+    df = df.dropna(subset=["TRAVELER_ID", "GENDER", "AGE_GRP", "동반자 관계"]).reset_index(drop=True)
+    df.rename(columns={"TRAVELER_ID": "USER_ID"}, inplace=True)
+    return df
+
+@st.cache_data
+def load_visit_data(
+    path: str = "C:/Users/Hoon/Downloads/V3_관광지카테고리_End (1).csv"
+) -> pd.DataFrame:
+    df = pd.read_csv(path, dtype=str)
+    # 평점 컬럼
+    if "TOTAL_SCORE" in df.columns:
+        df["TOTAL_SCORE"] = df["TOTAL_SCORE"].astype(float)
+    # 좌표 컬럼
+    if "X_COORD" in df.columns and "Y_COORD" in df.columns:
+        df["X_COORD"] = df["X_COORD"].astype(float)
+        df["Y_COORD"] = df["Y_COORD"].astype(float)
+    else:
+        st.warning("X_COORD/Y_COORD 컬럼이 없어 지도 시각화가 불가합니다.")
+    return df
+
+# ----------------------------------------------------
+# 2. One-Hot 인코더 학습
+# ----------------------------------------------------
+@st.cache_resource
+def fit_one_hot_encoder(df_profiles: pd.DataFrame) -> OneHotEncoder:
+    ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+    ohe.fit(df_profiles[["GENDER", "AGE_GRP", "동반자 관계"]])
+    return ohe
+
+# ----------------------------------------------------
+# 3. 유사 사용자 탐색
+# ----------------------------------------------------
+
+def get_similar_user_profiles(
+    df_profiles: pd.DataFrame,
+    input_profile: pd.DataFrame,
+    ohe: OneHotEncoder,
+    top_k: int = 150
+) -> pd.DataFrame:
+    X_all = ohe.transform(df_profiles[["GENDER","AGE_GRP","동반자 관계"]])
+    x_in = ohe.transform(input_profile)
+    sims = cosine_similarity(X_all, x_in).flatten()
+    df = df_profiles.copy()
+    df["sim_score"] = sims
+    return df.nlargest(top_k, "sim_score").reset_index(drop=True)
+
+# ----------------------------------------------------
+# 4. ID 포맷 맞추기
+# ----------------------------------------------------
+
+def format_user_ids(user_ids: pd.Series) -> list[str]:
+    return [f"{uid[0]}_{uid}" for uid in user_ids]
+
+# ----------------------------------------------------
+# 5. 관광지 필터링
+# ----------------------------------------------------
+
+def filter_pois(
+    df_visit: pd.DataFrame,
+    formatted_ids: list[str],
+    region: str
+) -> pd.DataFrame:
+    mask = df_visit["TRAVEL_ID"].isin(formatted_ids)
+    mask &= (df_visit["권역"] == region)
+    mask &= (df_visit["소분류"] == "관광지")
+    return df_visit.loc[mask].copy()
+
+# ----------------------------------------------------
+# 6. 협업 필터링 예측 점수 계산
+# ----------------------------------------------------
+
+def get_top_pois_by_cf(
+    df_filtered: pd.DataFrame,
+    df_neighbors: pd.DataFrame,
+    top_n: int = 10
+) -> pd.DataFrame:
+    df_cf = df_filtered[["TRAVEL_ID","VISIT_AREA_NM","TOTAL_SCORE"]].copy()
+    sim_map = {f"{uid[0]}_{uid}": score for uid, score in zip(df_neighbors["USER_ID"], df_neighbors["sim_score"])}
+    df_cf["sim_score"] = df_cf["TRAVEL_ID"].map(sim_map).fillna(0).astype(float)
+    agg = (
+        df_cf.groupby("VISIT_AREA_NM")
+             .apply(lambda g: (g["TOTAL_SCORE"]*g["sim_score"]).sum()/(g["sim_score"].sum()+1e-8))
+             .rename("pred_score")
+             .reset_index()
+    )
+    return agg.sort_values("pred_score", ascending=False).head(top_n)
+
+# ----------------------------------------------------
+# 7. Streamlit UI
+# ----------------------------------------------------
+
+def main():
+    st.set_page_config(page_title="협업 필터링 추천", layout="wide")
+    st.title("🤝 제주 협업 필터링 + 장바구니 & 지도 시각화")
+
+    # 데이터 로드
+    df_profiles = load_traveler_profiles()
+    df_visit = load_visit_data()
+    ohe = fit_one_hot_encoder(df_profiles)
+
+    # 세션 초기화: cart, recommendations
+    if "cart" not in st.session_state:
+        st.session_state.cart = []
+    if "recommendations" not in st.session_state:
+        st.session_state.recommendations = None
+
+    # 탭 구성
+    tab1, tab2 = st.tabs(["📌 추천", "🛒 장바구니"])
+
+    with tab1:
+        # 입력
+        st.sidebar.header("👤 프로필 입력")
+        gender = st.sidebar.selectbox("성별", sorted(df_profiles["GENDER"].unique()))
+        agegrp = st.sidebar.selectbox("연령대", sorted(df_profiles["AGE_GRP"].unique()))
+        comp = st.sidebar.selectbox("동반자 관계", sorted(df_profiles["동반자 관계"].unique()))
+        region = st.sidebar.selectbox("권역 선택", sorted(df_visit["권역"].dropna().unique()))
+        top_k = st.sidebar.slider("이웃 수(K)", 10, 200, 150)
+        top_n = st.sidebar.slider("추천 개수(N)", 5, 20, 10)
+        if st.sidebar.button("추천 시작"):
+            inp = pd.DataFrame([{"GENDER":gender, "AGE_GRP":agegrp, "동반자 관계":comp}])
+            neighbors = get_similar_user_profiles(df_profiles, inp, ohe, top_k)
+            formatted = format_user_ids(neighbors["USER_ID"])
+            df_filt = filter_pois(df_visit, formatted, region)
+            if df_filt.empty:
+                st.warning("조건에 맞는 결과가 없습니다.")
+                st.session_state.recommendations = None
+            else:
+                df_rec = get_top_pois_by_cf(df_filt, neighbors, top_n)
+                st.session_state.recommendations = df_rec
+        # 결과 표시
+        if st.session_state.recommendations is not None:
+            st.subheader(f"✨ 추천 관광지 Top {len(st.session_state.recommendations)}")
+            for idx, row in st.session_state.recommendations.iterrows():
+                place = row["VISIT_AREA_NM"]
+                score = row["pred_score"]
+                key = f"cb_{idx}"
+                st.markdown(f"### {place}  |  예측점수: {score:.2f}")
+                checked = st.checkbox("장바구니 담기", key=key)
+                if checked and place not in st.session_state.cart:
+                    st.session_state.cart.append(place)
+                if not checked and place in st.session_state.cart:
+                    st.session_state.cart.remove(place)
+                st.markdown("---")
+
+    with tab2:
+        st.subheader("🛒 내 장바구니")
+        if st.session_state.cart:
+            df_cart = pd.DataFrame(st.session_state.cart, columns=["VISIT_AREA_NM"])
+            df_cart = df_cart.merge(df_visit.drop_duplicates(subset=["VISIT_AREA_NM"]), on="VISIT_AREA_NM", how="left")
+            cols = ["VISIT_AREA_NM","LOTNO_ADDR","권역","소분류","세분류"]
+            st.dataframe(df_cart[cols], use_container_width=True)
+            # 지도 시각화: waypoints
+            waypoints = [[row["Y_COORD"], row["X_COORD"]] for _, row in df_cart.iterrows() if not pd.isna(row["X_COORD"])]
+            if len(waypoints) < 2:
+                st.warning("지도 시각화를 위해 최소 2개 장소가 필요합니다.")
+            else:
+                # st.map expects DataFrame with lat, lon
+                df_map = pd.DataFrame(waypoints, columns=["lat","lon"])
+                st.map(df_map)
+        else:
+            st.write("장바구니가 비어 있습니다.")
+
+if __name__ == "__main__":
+    main()
